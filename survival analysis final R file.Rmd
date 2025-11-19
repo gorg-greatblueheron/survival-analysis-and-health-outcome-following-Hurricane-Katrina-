@@ -1,0 +1,353 @@
+---
+title: "nhanes"
+author: "Hang Lei"
+date: "2025-04-19"
+output: html_document
+---
+
+load the package and inspect data 
+```{r load libraries, message = FALSE}
+library(mice)
+library(haven)
+library(dplyr)
+library(survival)
+library(ggplot2)
+library(survival)
+library(survminer)
+
+```
+
+Read the data from STATA to R. Change K6 score into categorical 
+```{r}
+analytic_data <- read_dta("analytic_data.dta")
+
+analytic_data <- subset(analytic_data, analytic_sample == 1)
+
+View(analytic_data) 
+
+write_dta(analytic_data, "analytic_data_beforeMI.dta")
+
+
+
+analytic_data$k6 <- ifelse(analytic_data$k6 == 0, "Non-case",
+                    ifelse(analytic_data$k6 == 1, "Mild/Moderate",
+                           ifelse(analytic_data$k6 == 2, "Serious", NA)))
+analytic_data$k6 <- factor(analytic_data$k6, 
+                           levels = c("Non-case", "Mild/Moderate", "Serious"))
+
+```
+
+Formatting the variables/cleaning
+```{r}
+DNORS <- analytic_data %>%
+  select(
+    returned, SRH, k6, home_damage, stuff_damage, phq9_score, ptsd, 
+    homeowner, black, female, religious, edu, pre_physical_severity_cat,
+    pre_mental_severity_cat, pcl_total, pss_4, fin_diff, linc, m2_impr, 
+    b5, agecat, selfemployed, selfemployed_preK,months_returned
+  ) %>%
+  mutate(
+    returned = as_factor(returned),
+    SRH = as_factor(SRH),
+    k6 = as_factor(k6),
+    home_damage = as_factor(home_damage),
+    stuff_damage = as_factor(stuff_damage),         
+    phq9_score = as.numeric(phq9_score),
+    ptsd = as_factor(ptsd), 
+    homeowner = as_factor(homeowner),
+    black = as_factor(black),                         
+    female = as_factor(female),
+    religious = as_factor(religious),
+    edu = as_factor(edu),
+    pre_physical_severity_cat = as_factor(pre_physical_severity_cat),
+    pre_mental_severity_cat = as_factor(pre_mental_severity_cat),
+    pcl_total = as.numeric(pcl_total),
+    pss_4 = as.numeric(pss_4),
+    fin_diff = as.numeric(fin_diff),
+    linc = as.numeric(linc),
+    m2_impr = as.numeric(m2_impr),
+    b5 = as.numeric(b5),
+    agecat = as_factor(agecat),
+    selfemployed = as_factor(selfemployed),
+    selfemployed_preK = as_factor(selfemployed_preK),
+    months_returned = as.numeric(months_returned)
+  )
+
+analytic_data$pcl_total
+```
+
+Multiple imputation
+```{r}
+# Run Multiple Imputation (mice)
+init <- mice(DNORS, maxit = 0, printFlag = FALSE)
+
+
+set.seed(123)
+imputed_data <- mice(DNORS,
+                     m = 5,         
+                     maxit = 50,    
+                     method = init$method,
+                     predictorMatrix = init$predictorMatrix,
+                     seed = 123)
+
+
+# check that imputed_data is valid mids object (successful run of imputed_data)
+
+class(imputed_data)
+
+comp1 <- complete(imputed_data, 1)
+length(comp1)
+
+nrow(complete(imputed_data, 2))  # Check the number of rows in the first imputed dataset
+
+```
+
+logistic regression model 
+```{r}
+
+# 1. Define your model using with()
+model_fit <- with(data = imputed_data,
+                  expr = glm(returned ~ SRH + k6 + home_damage + stuff_damage + 
+                               phq9_score + ptsd + homeowner + black + female + religious + 
+                               edu + pre_physical_severity_cat + pre_mental_severity_cat +
+                               pcl_total + pss_4 + fin_diff + linc + m2_impr + b5 + 
+                               agecat + selfemployed + selfemployed_preK, 
+                               family = binomial))
+
+
+# model with just physical/mental pre-existing condition 
+model_fit1 <- with(data = imputed_data,
+                  expr = glm(returned ~ k6 + home_damage + stuff_damage + 
+                               phq9_score + ptsd + homeowner + black + female + religious + 
+                               edu + pre_physical_severity_cat + pre_mental_severity_cat +
+                               pcl_total + pss_4 + fin_diff + linc + m2_impr + b5 + 
+                               agecat + selfemployed + selfemployed_preK, 
+                               family = binomial))
+
+
+# model with just self rated health 
+model_fit <- with(data = imputed_data,
+                  expr = glm(returned ~ SRH + k6 + home_damage + stuff_damage + 
+                               phq9_score + ptsd + homeowner + black + female + religious + 
+                               edu + pcl_total + pss_4 + fin_diff + linc + m2_impr + b5 + 
+                               agecat + selfemployed + selfemployed_preK, 
+                               family = binomial))
+
+
+
+# 2. Pool the results across imputations
+pooled_results <- pool(model_fit)
+
+# 3. View summary
+summary(pooled_results)
+
+
+# Get the summary table from the pooled model
+pooled_summary <- summary(pooled_results)
+
+# Exponentiate the log-odds estimates to get odds ratios and 95% CIs
+pooled_summary$OR <- exp(pooled_summary$estimate)
+pooled_summary$Lower <- exp(pooled_summary$estimate - 1.96 * pooled_summary$std.error)
+pooled_summary$Upper <- exp(pooled_summary$estimate + 1.96 * pooled_summary$std.error)
+
+pooled_summary
+
+#SRH
+#home_damage/ lot of damage
+#homeowner
+#education Graduate degree
+#self_employed
+
+
+#SRH - 
+#home_damage - 
+#pre_katrina_home_ownership 
+#race
+
+```
+
+
+Cox regression Weighted Full model(final model)
+```{r}
+
+# Cox Regression with Weights
+
+# 1. Convertimputed_data to imputationList（for use with mitools）
+library(mitools)
+imputed_list <- imputationList(lapply(1:5, function(i) complete(imputed_data, i)))
+
+# 2. Add weights to each dataset (make sure the weight column exists in analytic_data)
+for (i in 1:5) {
+  imputed_list$imputations[[i]]$adlt_wgt_s <- analytic_data$adlt_wgt_s
+}
+
+# 3. Create survey design object
+library(survey)
+design_list <- svydesign(ids = ~1, weights = ~adlt_wgt_s, data = imputed_list)
+
+# 4. Weighted Cox model (full model version)
+cox_weighted_model <- with(design_list, 
+                           svycoxph(Surv(months_returned, as.numeric(returned)) ~ 
+                                    SRH + k6 + home_damage + stuff_damage + 
+                                    phq9_score + ptsd + homeowner + black + female + religious + 
+                                    edu + pre_physical_severity_cat + pre_mental_severity_cat +
+                                    pcl_total + pss_4 + fin_diff + linc + m2_impr + b5 + 
+                                    agecat + selfemployed + selfemployed_preK))
+
+# 5. Combine the results
+pooled_weighted_cox <- MIcombine(cox_weighted_model)
+
+# 6. Organize the output (Add HR and 95% CI)
+summary_weighted <- summary(pooled_weighted_cox)
+
+print(colnames(summary_weighted))
+
+
+cox_formatted_weighted <- summary_weighted %>%
+  mutate(
+    `Hazard Ratio` = exp(results),
+    `95% CI Lower` = exp(`(lower`),
+    `95% CI Upper` = exp(`upper)`),
+    `z` = results / se,
+    `p-value` = round(2 * (1 - pnorm(abs(results / se))), 4)
+  ) %>%
+  select(`Hazard Ratio`, `95% CI Lower`, `95% CI Upper`, `p-value`) %>%
+  tibble::rownames_to_column("Variable")
+
+print(cox_formatted_weighted)
+
+
+```
+
+Cox regression weighted model without pre-existing condition (to see how it might confound SRH)
+
+```{r}
+# Cox Regression with Weights
+
+# 1. Convertimputed_data to imputationList（for use with mitools）
+library(mitools)
+imputed_list <- imputationList(lapply(1:5, function(i) complete(imputed_data, i)))
+
+# 2. Add weights to each dataset (make sure the weight column exists in analytic_data)
+for (i in 1:5) {
+  imputed_list$imputations[[i]]$adlt_wgt_s <- analytic_data$adlt_wgt_s
+}
+
+# 3. Create survey design object
+library(survey)
+design_list <- svydesign(ids = ~1, weights = ~adlt_wgt_s, data = imputed_list)
+
+# 4. Weighted Cox model (full model version)
+cox_weighted_model_without_pre <- with(design_list, 
+                           svycoxph(Surv(months_returned, as.numeric(returned)) ~ 
+                                    SRH + k6 + home_damage + stuff_damage + 
+                                    phq9_score + ptsd + homeowner + black + female + religious + 
+                                    edu  +
+                                    pcl_total + pss_4 + fin_diff + linc + m2_impr + b5 + 
+                                    agecat + selfemployed + selfemployed_preK))
+
+
+# 5. Combine the results
+pooled_weighted_cox_without_pre<- MIcombine(cox_weighted_model_without_pre)
+
+
+# 6. Organize the output (Add HR and 95% CI)
+summary_weighted_without_pre <- summary(pooled_weighted_cox_without_pre)
+
+print(colnames(summary_weighted_without_pre))
+
+
+cox_formatted_weighted_without_pre <- summary_weighted_without_pre %>%
+  mutate(
+    `Hazard Ratio` = exp(results),
+    `95% CI Lower` = exp(`(lower`),
+    `95% CI Upper` = exp(`upper)`),
+    `z` = results / se,
+    `p-value` = round(2 * (1 - pnorm(abs(results / se))), 4)
+  ) %>%
+  select(`Hazard Ratio`, `95% CI Lower`, `95% CI Upper`, `p-value`) %>%
+  tibble::rownames_to_column("Variable")
+
+print(cox_formatted_weighted_without_pre)
+
+
+```
+
+
+
+plot visualization 
+
+Pre-existing physical condition
+```{r}
+
+
+# Step 1: Recode the variable (if you haven't done it yet)
+analytic_data <- imputed_data %>%
+  mutate(pre_physical_severity_cat = factor(pre_physical_severity_cat,
+                                            levels = c(0, 1, 2),
+                                            labels = c("None", "Mild (1–2)", "Moderate/Severe (3+)")))
+
+# Step 2: Plot
+ggplot(analytic_data, aes(x = pre_physical_severity_cat)) +
+  geom_bar(fill = "red", color = "black") +
+  labs(
+    title = "Distribution of Physical Pre-existing Condition Severity",
+    x = "Physical Severity Category",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+```
+
+Pre-existing mental condition
+```{r}
+# Step 1: Recode the variable (if you haven't done it yet)
+analytic_data <- analytic_data %>%
+  mutate(pre_mental_severity_cat = factor(pre_mental_severity_cat,
+                                            levels = c(0, 1),
+                                            labels = c("No", "Yes")))
+
+# Step 2: Plot
+ggplot(analytic_data, aes(x = pre_mental_severity_cat)) +
+  geom_bar(fill = "blue", color = "black") +
+  labs(
+    title = "Distribution of  Pre-existing mental Condition Severity",
+    x = "Mental Severity Category",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+```
+
+*Survival probability plots over time(up to 60 months)*
+```{r}
+surv_obj <- Surv(time = analytic_data$months_returned, event = as.numeric(analytic_data$returned))
+
+# Fit Kaplan-Meier curve
+km_fit <- survfit(surv_obj ~ 1)
+
+# Plot survival curve (1 - return probability)
+ggsurvplot(km_fit,
+           data = analytic_data,
+           xlim = c(0, 60),
+           conf.int = TRUE,
+           xlab = "Months Since Hurricane Katrina",
+           ylab = "Proportion Not Yet Returned",
+           title = "Time to Return Over 60 Months",
+           risk.table = TRUE)
+
+```
+
+*Time to return status by physical condition severity* 
+```{r}
+fit_km <- survfit(Surv(months_returned, as.numeric(returned)) ~ pre_physical_severity_cat, data = analytic_data)
+
+ggsurvplot(fit_km, data = analytic_data, 
+           pval = TRUE, 
+           conf.int = TRUE,
+           title = "Time to Return by Physical Condition Severity",
+           xlab = "Months Since Katrina", ylab = "Proportion Not Returned")
+
+```
+
+There is no clear visual difference in return timing by physical health severity. There was no significant difference in time to return across levels of pre-existing physical condition severity.(Log-rank p = 0.61)Physical condition severity doesn't appear to strongly affect return probability 
